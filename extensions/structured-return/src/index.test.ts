@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, it, expect } from "vitest";
-import { stripCdPrefix, formatResult, finalizeResult, expandArtifactPaths } from "./index";
+import { stripCdPrefix, formatResult, finalizeResult, expandArtifactPaths, tailLines, formatLiveResult } from "./index";
 
 describe("stripCdPrefix", () => {
   it("strips cd /path && prefix", () => {
@@ -15,6 +15,39 @@ describe("stripCdPrefix", () => {
 
   it("handles paths with no trailing space variations", () => {
     expect(stripCdPrefix("cd /a/b/c &&npx eslint .")).toBe("npx eslint .");
+  });
+});
+
+describe("live output formatting", () => {
+  it("returns a bounded tail", () => {
+    const text = ["one", "two", "three", "four"].join("\n");
+    expect(tailLines(text, 2)).toBe("three\nfour");
+  });
+
+  it("formats a terminal-like partial result", () => {
+    const result = formatLiveResult({
+      command: "npm test",
+      elapsedMs: 2100,
+      stdoutBytes: 12,
+      stderrBytes: 3,
+      outputTail: "building...",
+      status: "running",
+    });
+    expect(result).toContain("running: npm test");
+    expect(result).toContain("elapsed: 2s");
+    expect(result).toContain("building...");
+  });
+
+  it("shows waiting text before command output arrives", () => {
+    const result = formatLiveResult({
+      command: "npm test",
+      elapsedMs: 0,
+      stdoutBytes: 0,
+      stderrBytes: 0,
+      outputTail: "",
+      status: "running",
+    });
+    expect(result).toContain("(waiting for output)");
   });
 });
 

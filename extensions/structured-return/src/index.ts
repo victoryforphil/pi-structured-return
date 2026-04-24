@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { globSync } from "glob";
 import { Type } from "@sinclair/typebox";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { AgentToolUpdateCallback, ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type { ObservedRunArgs, ParsedResult, RunContext } from "./types";
 import { ensureRunDir, writeRunArtifacts } from "./storage/log-store";
@@ -11,6 +11,23 @@ import { loadProjectConfig } from "./config/project-config";
 import { resolveParser, listParsers } from "./config/registry";
 import { safeReadFile } from "./parsers/utils";
 import { appendRun, readLifetimeStats, formatStatsBlock, type AggregatedStats } from "./storage/session-stats";
+
+type ToolUpdate = AgentToolUpdateCallback<StructuredReturnDetails | undefined>;
+
+type StructuredReturnDetails = {
+  exitCode?: number;
+  logPath?: string;
+  parser?: string;
+  rawBytes?: number;
+  parsedBytes?: number;
+  live?: {
+    status: "running" | "cancelled" | "complete";
+    elapsedMs: number;
+    stdoutBytes: number;
+    stderrBytes: number;
+    outputTail?: string;
+  };
+};
 
 export default function structuredReturn(pi: ExtensionAPI) {
   pi.registerCommand("sr-parsers", {
@@ -95,15 +112,15 @@ export default function structuredReturn(pi: ExtensionAPI) {
     async execute(
       _toolCallId: string,
       args: ObservedRunArgs,
-      _signal: AbortSignal | undefined,
-      _onUpdate: unknown,
+      signal: AbortSignal | undefined,
+      onUpdate: ToolUpdate | undefined,
       ctx: ExtensionContext
     ) {
       const cwd = args.cwd ?? ctx.cwd ?? process.cwd();
       const runDir = ensureRunDir(cwd);
       const runId = randomUUID();
       const argv = shellSplit(args.command);
-      const { stdout, stderr, exitCode } = await runCommand(args.command, cwd);
+      const { stdout, stderr, exitCode } = await runCommand(args.command, cwd, signal, onUpdate);
       const logs = writeRunArtifacts(runDir, runId, stdout, stderr);
       const artifactPaths = expandArtifactPaths(args.artifactPaths ?? [], cwd);
       const runCtx: RunContext = {
@@ -142,9 +159,13 @@ export default function structuredReturn(pi: ExtensionAPI) {
     renderCall(args: ObservedRunArgs) {
       return new Text(`structured_return ${args.command}`, 0, 0);
     },
-    renderResult(result: { content?: Array<{ type: string; text?: string }> }) {
+    renderResult(
+      result: { content?: Array<{ type: string; text?: string }>; details?: StructuredReturnDetails },
+      { isPartial }: { isPartial?: boolean },
+      theme
+    ) {
       const text = result?.content?.[0]?.text ?? "structured_return complete";
-      return new Text(text, 0, 0);
+      return new Text(isPartial ? theme.fg("warning", text) : text, 0, 0);
     },
   });
 }
@@ -186,19 +207,115 @@ function shellSplit(command: string): string[] {
   return command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g)?.map((s) => s.replace(/^['"]|['"]$/g, "")) ?? [];
 }
 
-function runCommand(command: string, cwd: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+function runCommand(
+  command: string,
+  cwd: string,
+  signal?: AbortSignal,
+  onUpdate?: ToolUpdate
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   return new Promise((resolve) => {
+    const startedAt = Date.now();
     const proc = spawn(command, { cwd, shell: true, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
-    proc.stdout.on("data", (d) => {
-      stdout += d.toString();
+    let combined = "";
+    let lastUpdateAt = 0;
+    let killedByAbort = false;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const emitUpdate = (force = false) => {
+      if (!onUpdate) return;
+      const now = Date.now();
+      if (!force && now - lastUpdateAt < 250) return;
+      lastUpdateAt = now;
+      const outputTail = tailLines(combined, 40);
+      onUpdate({
+        content: [
+          {
+            type: "text",
+            text: formatLiveResult({
+              command: stripCdPrefix(command),
+              elapsedMs: now - startedAt,
+              stdoutBytes: stdout.length,
+              stderrBytes: stderr.length,
+              outputTail,
+              status: killedByAbort ? "cancelled" : "running",
+            }),
+          },
+        ],
+        details: {
+          live: {
+            status: killedByAbort ? "cancelled" : "running",
+            elapsedMs: now - startedAt,
+            stdoutBytes: stdout.length,
+            stderrBytes: stderr.length,
+            outputTail,
+          },
+        },
+      });
+    };
+
+    const appendOutput = (chunk: Buffer, stream: "stdout" | "stderr") => {
+      const text = chunk.toString();
+      if (stream === "stdout") stdout += text;
+      else stderr += text;
+      combined += text;
+      emitUpdate();
+    };
+
+    const abort = () => {
+      killedByAbort = true;
+      proc.kill("SIGTERM");
+      killTimer = setTimeout(() => proc.kill("SIGKILL"), 2000);
+      killTimer.unref?.();
+      emitUpdate(true);
+    };
+
+    const tick = setInterval(() => emitUpdate(), 1000);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+
+    proc.stdout.on("data", (d: Buffer) => appendOutput(d, "stdout"));
+    proc.stderr.on("data", (d: Buffer) => appendOutput(d, "stderr"));
+    proc.on("error", (error) => {
+      stderr += `${error.message}\n`;
+      combined += `${error.message}\n`;
+      emitUpdate(true);
     });
-    proc.stderr.on("data", (d) => {
-      stderr += d.toString();
+    proc.on("close", (code) => {
+      clearInterval(tick);
+      if (killTimer) clearTimeout(killTimer);
+      signal?.removeEventListener("abort", abort);
+      emitUpdate(true);
+      resolve({ stdout, stderr, exitCode: killedByAbort ? 130 : (code ?? 1) });
     });
-    proc.on("close", (code) => resolve({ stdout, stderr, exitCode: code ?? 1 }));
   });
+}
+
+export function tailLines(text: string, maxLines: number): string {
+  if (!text.trim()) return "";
+  return text.replace(/\r\n/g, "\n").split("\n").slice(-maxLines).join("\n").trimEnd();
+}
+
+export function formatLiveResult(args: {
+  command: string;
+  elapsedMs: number;
+  stdoutBytes: number;
+  stderrBytes: number;
+  outputTail: string;
+  status: "running" | "cancelled" | "complete";
+}): string {
+  const elapsedSeconds = Math.max(0, Math.floor(args.elapsedMs / 1000));
+  const lines = [
+    `${args.status === "cancelled" ? "cancelled" : "running"}: ${args.command}`,
+    `elapsed: ${elapsedSeconds}s  stdout: ${args.stdoutBytes}B  stderr: ${args.stderrBytes}B`,
+  ];
+  if (args.outputTail) {
+    lines.push("", args.outputTail);
+  } else {
+    lines.push("", "(waiting for output)");
+  }
+  return lines.join("\n");
 }
 
 export function finalizeResult(
